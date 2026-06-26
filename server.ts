@@ -1545,6 +1545,7 @@ async function startServer() {
 
   const server = app.listen(PORT, "0.0.0.0", () => {
     log(`[Server] Listening on 0.0.0.0:${PORT}`);
+    log(`[Server] Local URL: http://localhost:${PORT}`);
     log(`[Server] Environment: ${process.env.NODE_ENV || 'development'}`);
   });
 
