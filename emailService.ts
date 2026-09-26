@@ -7,6 +7,26 @@ let transporter: Transporter | null = null;
 async function initTransporter() {
   if (transporter) return transporter;
   
+  // Use real SMTP if credentials are provided in env
+  if (process.env.SMTP_USER && process.env.SMTP_PASS) {
+    try {
+      transporter = nodemailer.createTransport({
+        host: process.env.SMTP_HOST || "smtp.gmail.com",
+        port: parseInt(process.env.SMTP_PORT || "587"),
+        secure: process.env.SMTP_PORT === "465", // true for 465, false for other ports
+        auth: {
+          user: process.env.SMTP_USER,
+          pass: process.env.SMTP_PASS,
+        },
+      });
+      console.log("[Email Service] Initialized SMTP Email account.");
+      return transporter;
+    } catch (error) {
+      console.error("[Email Service] Failed to initialize SMTP account:", error);
+    }
+  }
+  
+  // Fallback to test account
   try {
     const testAccount = await nodemailer.createTestAccount();
     transporter = nodemailer.createTransport({
@@ -75,7 +95,7 @@ export async function sendPaymentSuccessEmail(options: PaymentEmailOptions): Pro
     `;
 
     const info = await t.sendMail({
-      from: '"Carebridge+ Billing" <billing@carebridgeplus.com>',
+      from: `"Carebridge+ Billing" <${process.env.SMTP_USER || 'billing@carebridgeplus.com'}>`,
       to: options.toEmail,
       subject: "Carebridge+ Payment Successful — Thank You",
       html: htmlBody,
@@ -91,7 +111,7 @@ export async function sendPaymentSuccessEmail(options: PaymentEmailOptions): Pro
   }
 }
 
-export async function sendWelcomeEmail(options: { toEmail: string; accountType: string; name: string }) {
+export async function sendWelcomeEmail(options: { toEmail: string; accountType: string; name: string; username?: string; password?: string }) {
   try {
     const t = await initTransporter();
     
@@ -99,7 +119,12 @@ export async function sendWelcomeEmail(options: { toEmail: string; accountType: 
       <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; color: #333;">
         <h2 style="color: #0077b6;">Welcome to the CareBridge+ Family!</h2>
         <p>Hi ${options.name},</p>
-        <p>Your registration as a <strong>${options.accountType.toUpperCase()}</strong> was successful and your credentials have been securely saved.</p>
+        <p>Your registration successfully done. Our admin team will give you approval within 10-15 min.</p>
+        <p>Your credentials are as follows. Please save it.</p>
+        <ul>
+          <li><strong>Username:</strong> ${options.username || options.toEmail}</li>
+          <li><strong>Password:</strong> ${options.password || '********'}</li>
+        </ul>
         <p>We are thrilled to have you with us. You can now log in and explore all the features we have tailored for you.</p>
         <br/>
         <p>Thank You,<br/><strong>Carebridge+ Team</strong></p>
@@ -107,7 +132,7 @@ export async function sendWelcomeEmail(options: { toEmail: string; accountType: 
     `;
 
     const info = await t.sendMail({
-      from: '"Carebridge+ Welcome" <welcome@carebridgeplus.com>',
+      from: `"Carebridge+ Welcome" <${process.env.SMTP_USER || 'welcome@carebridgeplus.com'}>`,
       to: options.toEmail,
       subject: "Registration Successful — Welcome to Carebridge+ Family",
       html: htmlBody,
@@ -121,4 +146,62 @@ export async function sendWelcomeEmail(options: { toEmail: string; accountType: 
     console.error("[Email Service] Error sending welcome email:", error);
     return { success: false };
   }
+}
+
+export async function sendTrialStartedEmail(options: { toEmail: string; name: string; planName: string; trialEnd: string }) {
+  try {
+    const t = await initTransporter();
+    if (!t) return { success: false };
+    const htmlBody = `
+      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; color: #333;">
+        <h2 style="color: #0077b6;">Your Carebridge+ Trial has Started!</h2>
+        <p>Hello <strong>${options.name}</strong>,</p>
+        <p>Your 3-day free trial for <strong>${options.planName}</strong> is now active.</p>
+        <p>Your trial will end on: <strong>${options.trialEnd}</strong></p>
+        <p>Explore all the premium features and see how Carebridge+ can transform your workflow.</p>
+        <br/>
+        <p>Thank You,<br/><strong>Carebridge+ Team</strong></p>
+      </div>
+    `;
+    const info = await t.sendMail({ from: `"Carebridge+" <${process.env.SMTP_USER || 'noreply@carebridgeplus.com'}>`, to: options.toEmail, subject: "Your Carebridge+ Trial has Started!", html: htmlBody });
+    return { success: true, messageId: info.messageId };
+  } catch (e) { return { success: false }; }
+}
+
+export async function sendTrialExpiredEmail(options: { toEmail: string; name: string }) {
+  try {
+    const t = await initTransporter();
+    if (!t) return { success: false };
+    const htmlBody = `
+      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; color: #333;">
+        <h2 style="color: #0077b6;">Your Carebridge+ Trial has Expired</h2>
+        <p>Hello <strong>${options.name}</strong>,</p>
+        <p>Your 3-day free trial has come to an end.</p>
+        <p>To continue using Carebridge+ and retain access to your dashboard, please subscribe to one of our premium plans.</p>
+        <br/>
+        <p>Thank You,<br/><strong>Carebridge+ Team</strong></p>
+      </div>
+    `;
+    const info = await t.sendMail({ from: `"Carebridge+" <${process.env.SMTP_USER || 'noreply@carebridgeplus.com'}>`, to: options.toEmail, subject: "Your Carebridge+ Trial has Expired", html: htmlBody });
+    return { success: true, messageId: info.messageId };
+  } catch (e) { return { success: false }; }
+}
+
+export async function sendPaymentFailedEmail(options: { toEmail: string; name: string; amount: number }) {
+  try {
+    const t = await initTransporter();
+    if (!t) return { success: false };
+    const htmlBody = `
+      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; color: #333;">
+        <h2 style="color: #d32f2f;">Carebridge+ Payment Failed</h2>
+        <p>Hello <strong>${options.name}</strong>,</p>
+        <p>Unfortunately, your recent payment attempt of ₹${options.amount} was unsuccessful.</p>
+        <p>No charges were made to your account. Please try again or use a different payment method to activate your subscription.</p>
+        <br/>
+        <p>Thank You,<br/><strong>Carebridge+ Team</strong></p>
+      </div>
+    `;
+    const info = await t.sendMail({ from: `"Carebridge+" <${process.env.SMTP_USER || 'noreply@carebridgeplus.com'}>`, to: options.toEmail, subject: "Carebridge+ Payment Failed", html: htmlBody });
+    return { success: true, messageId: info.messageId };
+  } catch (e) { return { success: false }; }
 }

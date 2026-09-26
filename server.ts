@@ -9,7 +9,7 @@ dotenv.config({ path: path.resolve(process.cwd(), ".env") });
 import { GoogleGenAI, Modality } from "@google/genai";
 import { getApps, initializeApp } from 'firebase-admin/app';
 import { getFirestore } from 'firebase-admin/firestore';
-import { sendPaymentSuccessEmail } from './emailService.js';
+import { sendPaymentSuccessEmail, sendTrialStartedEmail, sendTrialExpiredEmail, sendPaymentFailedEmail, sendWelcomeEmail } from './emailService.js';
 
 const logFile = path.resolve(process.cwd(), "server.log");
 const log = (msg: string) => {
@@ -1752,6 +1752,17 @@ Based on your health context, maintaining regular physical activity, balanced fi
         }
       })();
 
+      const userEmail = details?.email || username;
+      if (userEmail && userEmail.includes('@')) {
+        sendWelcomeEmail({
+          toEmail: userEmail,
+          accountType: role,
+          name: name,
+          username: username,
+          password: password
+        }).catch(err => console.error("[Server] Failed to send welcome email:", err));
+      }
+
       res.json({ success: true, message: "Registration successful. Waiting for admin approval." });
     } catch (error) {
       console.error("[Server] Registration error:", error);
@@ -1935,13 +1946,13 @@ Based on your health context, maintaining regular physical activity, balanced fi
   
   app.post("/api/email/welcome", async (req, res) => {
     try {
-      const { email, accountType, name } = req.body;
+      const { email, accountType, name, username, password } = req.body;
       if (!email || !accountType) {
         return res.status(400).json({ success: false, message: "Missing required fields" });
       }
       
       const { sendWelcomeEmail } = await import("./emailService.js");
-      const result = await sendWelcomeEmail({ toEmail: email, accountType, name: name || "User" });
+      const result = await sendWelcomeEmail({ toEmail: email, accountType, name: name || "User", username, password });
       
       if (result.success) {
         return res.status(200).json({ success: true, messageId: result.messageId });
@@ -2398,10 +2409,12 @@ Based on your health context, maintaining regular physical activity, balanced fi
     }
   }
 
-  // Plan config
-  const PLANS = {
-    CLINIC: { amount: 28900, currency: 'INR', label: 'Carebridge+ Clinic Plan ₹289/month' },
-    HOSPITAL: { amount: 289000, currency: 'INR', label: 'Carebridge+ Hospital Plan ₹2,890/month' },
+  // Centralized Plan Config
+  const PLANS: Record<string, any> = {
+    CLINIC_MONTHLY: { planId: 'CLINIC_MONTHLY', organizationType: 'CLINIC', planName: 'Carebridge+ Clinic Monthly', billingCycle: 'monthly', amount: 32900, currency: 'INR', trialDays: 3, active: true },
+    CLINIC_YEARLY: { planId: 'CLINIC_YEARLY', organizationType: 'CLINIC', planName: 'Carebridge+ Clinic Yearly', billingCycle: 'yearly', amount: 339900, currency: 'INR', trialDays: 3, active: true },
+    HOSPITAL_MONTHLY: { planId: 'HOSPITAL_MONTHLY', organizationType: 'HOSPITAL', planName: 'Carebridge+ Hospital Monthly', billingCycle: 'monthly', amount: 329900, currency: 'INR', trialDays: 3, active: true },
+    HOSPITAL_YEARLY: { planId: 'HOSPITAL_YEARLY', organizationType: 'HOSPITAL', planName: 'Carebridge+ Hospital Yearly', billingCycle: 'yearly', amount: 3399900, currency: 'INR', trialDays: 3, active: true },
   };
 
   // ---- GET /api/subscription/server-time ----
@@ -2424,7 +2437,7 @@ Based on your health context, maintaining regular physical activity, balanced fi
       const userData = await firestoreGet('users', userId);
       if (userData && userData.hasUsedTrial === true) {
         log(`[Subscription] initTrial: userId=${userId} already has trial, skipping`);
-        return res.json({ success: true, alreadyUsed: true });
+        return res.status(403).json({ success: false, error: 'Free trial has already been used for this account.' });
       }
 
       const now = new Date();
@@ -2455,6 +2468,15 @@ Based on your health context, maintaining regular physical activity, balanced fi
         trialEndAt: trialEnd.toISOString(),
       });
 
+      if (userData?.email) {
+        await sendTrialStartedEmail({
+          toEmail: userData.email,
+          name: userData.name || 'User',
+          planName: planType === 'CLINIC' ? 'Carebridge+ Clinic' : 'Carebridge+ Hospital',
+          trialEnd: trialEnd.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
+        }).catch(e => log(`Failed to send trial started email: ${e}`));
+      }
+
       log(`[Subscription] Trial initialized for userId=${userId} planType=${planType} trialEndAt=${trialEnd.toISOString()}`);
       res.json({ success: true, trialEndAt: trialEnd.getTime(), trialStartAt: now.getTime() });
     } catch (e: any) {
@@ -2483,6 +2505,14 @@ Based on your health context, maintaining regular physical activity, balanced fi
           currentStatus = 'expired';
           await firestorePatch('users', userId, { subscriptionStatus: 'expired', dashboardAccess: false });
           await auditSubscriptionEvent(userId, 'trial_expired', { expiredAt: new Date().toISOString() });
+          
+          if (userData?.email) {
+            await sendTrialExpiredEmail({
+              toEmail: userData.email,
+              name: userData.name || 'User'
+            }).catch(e => log(`Failed to send trial expired email: ${e}`));
+          }
+          
           log(`[Subscription] Trial expired for userId=${userId}`);
         }
       } else if (currentStatus === 'active' && (userData.subscriptionNextBillingAt || userData.subscriptionExpiresAt)) {
@@ -2518,14 +2548,15 @@ Based on your health context, maintaining regular physical activity, balanced fi
 
   // ---- POST /api/subscription/create-order ----
   app.post('/api/subscription/create-order', async (req, res) => {
-    const { userId, planType } = req.body;
+    const { userId, planType, subscriptionType = 'monthly' } = req.body;
     if (!userId || !planType) {
       return res.status(400).json({ success: false, error: 'userId and planType required' });
     }
 
-    const plan = (PLANS as any)[planType];
+    const planId = req.body.planId || `${planType}_${subscriptionType.toUpperCase()}`;
+    const plan = (PLANS as any)[planId];
     if (!plan) {
-      return res.status(400).json({ success: false, error: 'Invalid planType' });
+      return res.status(400).json({ success: false, error: `Invalid planId: ${planId}` });
     }
 
     const razorpayKeyId = process.env.RAZORPAY_KEY_ID || '';
@@ -2537,7 +2568,7 @@ Based on your health context, maintaining regular physical activity, balanced fi
     if (isMockMode) {
       // Return mock order for development/testing without real Razorpay keys
       const mockOrderId = `order_mock_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
-      log(`[Subscription] MOCK MODE: Returning mock order ${mockOrderId} for userId=${userId} planType=${planType}`);
+      log(`[Subscription] MOCK MODE: Returning mock order ${mockOrderId} for userId=${userId} planId=${planId}`);
       return res.json({
         success: true,
         orderId: mockOrderId,
@@ -2573,10 +2604,11 @@ Based on your health context, maintaining regular physical activity, balanced fi
       }
 
       const order: any = await razorpayRes.json();
-      log(`[Subscription] Order created: ${order.id} for userId=${userId} planType=${planType}`);
+      log(`[Subscription] Order created: ${order.id} for userId=${userId} planId=${planId}`);
 
       await auditSubscriptionEvent(userId, 'payment_initiated', {
         orderId: order.id,
+        planId,
         planType,
         amount: plan.amount,
       });
@@ -2599,11 +2631,13 @@ Based on your health context, maintaining regular physical activity, balanced fi
 
   // ---- POST /api/subscription/verify-payment ----
   app.post('/api/subscription/verify-payment', async (req, res) => {
-    const { razorpay_order_id, razorpay_payment_id, razorpay_signature, userId, planType, isMockMode } = req.body;
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature, userId, planType, isMockMode, subscriptionType = 'monthly' } = req.body;
 
     if (!userId || !planType) {
       return res.status(400).json({ success: false, error: 'userId and planType required' });
     }
+    const planId = req.body.planId || `${planType}_${subscriptionType.toUpperCase()}`;
+    const plan = (PLANS as any)[planId];
 
     try {
       // Mock mode bypass (development only)
@@ -2622,14 +2656,15 @@ Based on your health context, maintaining regular physical activity, balanced fi
 
       const now = new Date();
       const nextBilling = new Date(now);
-      const isYearly = req.body.subscriptionType === 'yearly';
+      const isYearly = subscriptionType === 'yearly';
       const daysToAdd = isYearly ? 360 : 30; // 30 days for monthly, 360 days for yearly as requested
       nextBilling.setDate(nextBilling.getDate() + daysToAdd);
 
       const subscriptionFields: Record<string, any> = {
         subscriptionStatus: 'active',
-        planType,
-        subscriptionPlan: planType,
+        planId,
+        planType: plan ? plan.organizationType : planType,
+        subscriptionPlan: plan ? plan.planName : planType,
         subscriptionType: isYearly ? 'yearly' : 'monthly',
         paymentStatus: 'paid',
         subscriptionStartAt: now.toISOString(),
@@ -2650,13 +2685,60 @@ Based on your health context, maintaining regular physical activity, balanced fi
       await auditSubscriptionEvent(userId, 'payment_successful', {
         orderId: razorpay_order_id || 'mock',
         paymentId: razorpay_payment_id || 'mock',
+        planId,
         planType,
-        amount: (PLANS as any)[planType]?.amount || 0,
+        amount: plan ? plan.amount : 0,
         subscriptionStartAt: now.toISOString(),
         nextBillingAt: nextBilling.toISOString(),
       });
 
-      log(`[Subscription] Subscription ACTIVATED for userId=${userId} planType=${planType}`);
+      const userData = await firestoreGet('users', userId);
+      if (userData?.email) {
+        await sendPaymentSuccessEmail({
+          toEmail: userData.email,
+          name: userData.name || 'User',
+          plan: plan ? plan.planName : planType,
+          amount: (plan ? plan.amount : 0) / 100,
+          paymentMethod: 'UPI/Card',
+          transactionId: razorpay_order_id || 'mock_order',
+          paymentId: razorpay_payment_id || 'mock_pay',
+          date: now.toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata' }),
+          time: now.toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' }),
+          subscriptionStart: now.toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata' }),
+          subscriptionEnd: nextBilling.toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata' })
+        }).catch(e => log(`Failed to send payment success email: ${e}`));
+      }
+
+      try {
+        if (db) {
+          const stmt = db.prepare(`
+            INSERT INTO payments (
+              user_id, account_type, plan_type, billing_cycle,
+              amount, currency, transaction_id, payment_id,
+              status, payment_method, email_status, paid_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `);
+          stmt.run(
+            userId,
+            plan ? plan.organizationType : planType,
+            plan ? plan.planId : planType,
+            isYearly ? 'yearly' : 'monthly',
+            (plan ? plan.amount : 0) / 100, // convert paise to INR
+            'INR',
+            razorpay_order_id || 'mock',
+            razorpay_payment_id || 'mock',
+            'SUCCESS',
+            'UPI',
+            'PENDING',
+            now.toISOString()
+          );
+          log(`[Subscription] Inserted payment record into SQLite for Admin Panel (userId=${userId})`);
+        }
+      } catch (dbErr: any) {
+        log(`[Subscription] SQLite insertion error (non-fatal): ${dbErr.message}`);
+      }
+
+      log(`[Subscription] Subscription ACTIVATED for userId=${userId} planId=${planId}`);
       res.json({
         success: true,
         subscriptionStatus: 'active',
@@ -2712,9 +2794,45 @@ Based on your health context, maintaining regular physical activity, balanced fi
           subscriptionNextBillingAt: nextBilling.toISOString(),
         });
         await auditSubscriptionEvent(userId, 'webhook_payment_captured', { eventType, paymentId: paymentEntity?.id });
+        try {
+          if (db) {
+            const stmt = db.prepare(`
+              INSERT INTO payments (
+                user_id, account_type, plan_type, billing_cycle,
+                amount, currency, transaction_id, payment_id,
+                status, payment_method, email_status, paid_at
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `);
+            stmt.run(
+              userId,
+              planType,
+              planType,
+              'monthly', // Assume monthly by default for webhook renewals unless passed in notes
+              (paymentEntity?.amount || 0) / 100, // convert paise to INR
+              paymentEntity?.currency || 'INR',
+              paymentEntity?.order_id || 'renewal',
+              paymentEntity?.id || 'mock',
+              'SUCCESS',
+              'UPI_AUTOPAY',
+              'PENDING',
+              now.toISOString()
+            );
+            log(`[Subscription] Inserted payment record into SQLite from Webhook (userId=${userId})`);
+          }
+        } catch (dbErr: any) {
+          log(`[Subscription] SQLite insertion error in webhook (non-fatal): ${dbErr.message}`);
+        }
       } else if (eventType === 'payment.failed' && userId) {
         await firestorePatch('users', userId, { paymentStatus: 'failed', subscriptionStatus: 'payment_failed' });
         await auditSubscriptionEvent(userId, 'webhook_payment_failed', { eventType });
+        const userData = await firestoreGet('users', userId);
+        if (userData?.email) {
+          await sendPaymentFailedEmail({
+            toEmail: userData.email,
+            name: userData.name || 'User',
+            amount: (paymentEntity?.amount || 0) / 100
+          }).catch(e => log(`Failed to send payment failed email: ${e}`));
+        }
       } else if (eventType === 'subscription.cancelled' && userId) {
         await firestorePatch('users', userId, { subscriptionStatus: 'cancelled', cancelAtPeriodEnd: true });
         await auditSubscriptionEvent(userId, 'webhook_subscription_cancelled', { eventType });
